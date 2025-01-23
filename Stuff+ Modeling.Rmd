@@ -1,0 +1,233 @@
+---
+title: "MLB Season 23 Stuff+ Modeling Attempts"
+output:
+  html_document:
+    df_print: paged
+classoption: landscape
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+library(tidyverse)
+library(knitr)
+library(dplyr) # for df stuff
+library(baseballr) # for statcast queries
+library(ggplot2)
+library(caret)
+library(doParallel)
+# library(rpart)
+library(C50)
+```
+
+```{r, include = FALSE}
+# Read the Data
+mlb_reg_21 <- read.csv(file = 'mlb_reg_21.csv')
+mlb_reg_22 <- read.csv(file = 'mlb_reg_22.csv')
+mlb_reg_23 <- read.csv(file = 'mlb_reg_23.csv')
+
+mlb_reg_2122 <- rbind(mlb_reg_21, mlb_reg_22)
+
+rm(mlb_reg_21, mlb_reg_22)
+```
+
+# Overview
+
+Stuff+ is a tricky statistic... there are many ways we could go about it. For this stage of the modeling/file, we are going to...
+
+Many considerations: 
+
+- Different model for each pitch?
+
+- What attributes do we want?
+
+- How to handle different handedness?
+
+- I'm sure more will come up
+
+
+## First thing is first: Data filtering and Exploratory Analysis
+
+
+
+```{r}
+# Preprocessing here
+mlb_reg_2122 <- mlb_reg_2122 %>% filter(!is.na(ind_vert_break), !is.na(horz_break),
+                                        !is.na(release_extension), !is.na(release_pos_x),
+                                        !is.na(release_pos_y), !is.na(release_speed),
+                                        description != "pitchout", balls < 4, strikes < 3,
+                                        outs_when_up < 3,!is.na(delta_run_exp),
+                                        !str_detect(des, "pickoff"),
+                                        !str_detect(des, "caught_stealing"), 
+                                        !str_detect(des, "stolen_"),
+                                        !events %in% c("game_advisory", "catcher_interf"))
+
+mlb_reg_23 <- mlb_reg_23 %>% filter(!is.na(ind_vert_break), !is.na(horz_break),
+                                    !is.na(release_extension), !is.na(release_pos_x),
+                                    !is.na(release_pos_y), !is.na(release_speed),
+                                    description != "pitchout", balls < 4, strikes < 3,
+                                    outs_when_up <3, !is.na(delta_run_exp),
+                                    !str_detect(des, "pickoff"),
+                                    !str_detect(des, "caught_stealing"), 
+                                    !str_detect(des, "stolen_"),
+                                    !events %in% c("game_advisory", "catcher_interf"))
+
+mlb_reg_2122$RV_events <- ifelse((mlb_reg_2122$description == "hit_into_play"),
+                                 mlb_reg_2122$events, mlb_reg_2122$description)
+mlb_reg_2122$RV_events <- ifelse((mlb_reg_2122$RV_events == "foul_pitchout"),
+                                 "foul", mlb_reg_2122$RV_events)
+
+mlb_reg_2122$RV_events <- ifelse(mlb_reg_2122$RV_events %in% c("fielders_choice", "force_out", "field_error", "sac_bunt", "sac_fly", "grounded_into_double_play", "sac_fly_double_play", "fielders_choice_out", "double_play", "triple_play", "sac_bunt_double_play", "field_out"), "out", mlb_reg_2122$RV_events)
+
+mlb_reg_23$RV_events <- ifelse((mlb_reg_23$description == "hit_into_play"),
+                                 mlb_reg_23$events, mlb_reg_23$description)
+mlb_reg_23$RV_events <- ifelse((mlb_reg_23$RV_events == "foul_pitchout"),
+                                 "foul", mlb_reg_23$RV_events)
+
+mlb_reg_23$RV_events <- ifelse(mlb_reg_23$RV_events %in% c("fielders_choice", "force_out", "field_error", "sac_bunt", "sac_fly", "grounded_into_double_play", "sac_fly_double_play", "fielders_choice_out", "double_play", "triple_play", "sac_bunt_double_play", "field_out"), "out", mlb_reg_23$RV_events)
+
+# some mlb23 specific stuff
+mlb_reg_23$RV_events <- ifelse((mlb_reg_23$RV_events %in% c("blocked_ball")),
+                                 "ball", mlb_reg_23$RV_events)
+mlb_reg_23$RV_events <- ifelse((mlb_reg_23$RV_events %in% c("bunt_foul_tip", "foul_bunt",
+                                                            "foul_tip")),
+                                 "foul", mlb_reg_23$RV_events)
+mlb_reg_23$RV_events <- ifelse((mlb_reg_23$RV_events %in% c("missed_bunt", "swinging_strike_blocked")),
+                                 "swinging_strike", mlb_reg_23$RV_events)
+
+average_DRE2122 <- mlb_reg_2122 %>%
+  group_by(RV_events) %>%
+  dplyr::summarize(average_DRE = mean(delta_run_exp))
+
+average_DRE23 <- mlb_reg_23 %>% 
+  group_by(RV_events) %>%
+  dplyr::summarize(average_DRE = mean(delta_run_exp))
+
+mlb_reg_2122$RV_events <- as.factor(mlb_reg_2122$RV_events)
+mlb_reg_23$RV_events <- as.factor(mlb_reg_23$RV_events)
+```
+
+
+```{r}
+# Train on each pitch separately?
+mlb_reg_2122_LHP_FB <- mlb_reg_2122 %>% filter(pitch_type == "FF" & p_throws == "L")
+# mlb_reg_2122_LHP_SI <- mlb_reg_2122 %>% filter(pitch_type == "SI" & p_throws == "L")
+# mlb_reg_2122_LHP_CT <- mlb_reg_2122 %>% filter(pitch_type == "FC" & p_throws == "L")
+# mlb_reg_2122_LHP_CB <- mlb_reg_2122 %>% filter(pitch_type %in% c("CU", "SC") & p_throws == "L") # Curve, slow curve, sweeping curve, etc
+# mlb_reg_2122_LHP_SL <- mlb_reg_2122 %>% filter(pitch_type %in% c("SL", " ") & p_throws == "L") # slider and sweeper
+# mlb_reg_2122_LHP_CH <- mlb_reg_2122 %>% filter(pitch_type == "CH" & p_throws == "L")
+# mlb_reg_2122_LHP_SPL <- mlb_reg_2122 %>% filter(pitch_type %in% c("FS", "FO") & p_throws == "L") # Fork and Split
+# 
+mlb_reg_2122_RHP_FB <- mlb_reg_2122 %>% filter(pitch_type == "FF" & p_throws == "R")
+# mlb_reg_2122_RHP_SI <- mlb_reg_2122 %>% filter(pitch_type == "SI" & p_throws == "R")
+# mlb_reg_2122_RHP_CT <- mlb_reg_2122 %>% filter(pitch_type == "FC" & p_throws == "R")
+# mlb_reg_2122_RHP_CB <- mlb_reg_2122 %>% filter(pitch_type %in% c("CU", "SC") & p_throws == "R") # Curve, slow curve, sweeping curve, etc
+# mlb_reg_2122_RHP_SL <- mlb_reg_2122 %>% filter(pitch_type %in% c("SL", " ") & p_throws == "R") # slider and sweeper
+# mlb_reg_2122_RHP_CH <- mlb_reg_2122 %>% filter(pitch_type == "CH" & p_throws == "R")
+# mlb_reg_2122_RHP_SPL <- mlb_reg_2122 %>% filter(pitch_type %in% c("FS", "FO") & p_throws == "R") # Fork and Split
+
+mlb_reg_23_LHP_FB <- mlb_reg_23 %>% filter(pitch_type == "FF" & p_throws == "L")
+# mlb_reg_23_LHP_SI <- mlb_reg_23 %>% filter(pitch_type %in% c("SI", "FT") & p_throws == "L")
+# mlb_reg_23_LHP_CT <- mlb_reg_23 %>% filter(pitch_type == "FC" & p_throws == "L")
+# mlb_reg_23_LHP_CB <- mlb_reg_23 %>% filter(pitch_type %in% c("CU", "SC", "KC") & p_throws == "L") # Curve, slow curve, sweeping curve, etc
+# mlb_reg_23_LHP_SL <- mlb_reg_23 %>% filter(pitch_type %in% c("SL", "ST", "SV") & p_throws == "L") # slider and sweeper
+# mlb_reg_23_LHP_CH <- mlb_reg_23 %>% filter(pitch_type == "CH" & p_throws == "L")
+# mlb_reg_23_LHP_SPL <- mlb_reg_23 %>% filter(pitch_type %in% c("FS", "FO") & p_throws == "L") # Fork and Split
+# 
+mlb_reg_23_RHP_FB <- mlb_reg_23 %>% filter(pitch_type == "FF" & p_throws == "R")
+# mlb_reg_23_RHP_SI <- mlb_reg_23 %>% filter(pitch_type %in% c("SI", "FT") & p_throws == "R")
+# mlb_reg_23_RHP_CT <- mlb_reg_23 %>% filter(pitch_type == "FC" & p_throws == "R")
+# mlb_reg_23_RHP_CB <- mlb_reg_23 %>% filter(pitch_type %in% c("CU", "SC", "KC") & p_throws == "R") # Curve, slow curve, sweeping curve, etc
+# mlb_reg_23_RHP_SL <- mlb_reg_23 %>% filter(pitch_type %in% c("SL", "ST", "SV") & p_throws == "R") # slider and sweeper
+# mlb_reg_23_RHP_CH <- mlb_reg_23 %>% filter(pitch_type == "CH" & p_throws == "R")
+# mlb_reg_23_RHP_SPL <- mlb_reg_23 %>% filter(pitch_type %in% c("FS", "FO") & p_throws == "R") # Fork and Split
+
+rm(mlb_reg_2122, mlb_reg_23)
+```
+
+# Different approach - No more KNN - Try decision trees and work to xgboost?
+
+```{r}
+vars <- c("ind_vert_break", "horz_break", "release_extension", "release_pos_x", "release_pos_y", "release_speed", "release_spin_rate")
+
+rhp_fb_c50 <- C5.0(x = mlb_reg_2122_RHP_FB[,vars], y = mlb_reg_2122_RHP_FB$RV_events)
+# summary(rhp_fb_c50)
+```
+
+```{r}
+prediction <- predict(rhp_fb_c50, newdata = mlb_reg_23_RHP_FB[,vars])
+cf <- confusionMatrix(prediction, as.factor(mlb_reg_23_RHP_FB$RV_events))
+print(cf)
+```
+
+```{r}
+pred_probs_c50 <- as.data.frame(predict(rhp_fb_c50, newdata = mlb_reg_23_RHP_FB[,vars], type = "prob"))
+```
+
+
+
+```{r}
+pred_probs_c50$out <- pred_probs_c50$out * average_DRE23$average_DRE[7]
+pred_probs_c50$single <- pred_probs_c50$single * average_DRE23$average_DRE[8]
+pred_probs_c50$double <- pred_probs_c50$double * average_DRE23$average_DRE[3]
+pred_probs_c50$triple <- pred_probs_c50$triple * average_DRE23$average_DRE[10]
+pred_probs_c50$home_run <- pred_probs_c50$home_run * average_DRE23$average_DRE[6]
+pred_probs_c50$ball <- pred_probs_c50$ball * average_DRE23$average_DRE[1]
+pred_probs_c50$called_strike <- pred_probs_c50$called_strike * average_DRE23$average_DRE[2]
+pred_probs_c50$swinging_strike <- pred_probs_c50$swinging_strike * average_DRE23$average_DRE[9]
+pred_probs_c50$hit_by_pitch <- pred_probs_c50$hit_by_pitch * average_DRE23$average_DRE[5]
+pred_probs_c50$foul <- pred_probs_c50$foul * average_DRE23$average_DRE[4]
+
+stuff_vec_c50 <- rowSums(pred_probs_c50)
+```
+
+
+```{r}
+mlb_reg_23_RHP_FB$raw_stuff_c50 <- stuff_vec_c50
+mlb_reg_23_RHP_FB$normalized_stuff_c50 <- (mlb_reg_23_RHP_FB$raw_stuff_c50 - mean(mlb_reg_23_RHP_FB$raw_stuff_c50))/sd(mlb_reg_23_RHP_FB$raw_stuff_c50)
+mlb_reg_23_RHP_FB$final_stuff <- mlb_reg_23_RHP_FB$normalized_stuff_c50*50 + 100        
+
+rhp_fb_stuff <- mlb_reg_23_RHP_FB %>% group_by(player_name) %>%
+  dplyr::summarize('T2Stuff+' = mean(final_stuff))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+## First approach - Linear Regression
+
+```{r}
+# 21-22 train, 23 test
+```
+
+```{r}
+# lhp_fb_mod <- lm(delta_run_exp ~ I(ind_vert_break^2) + I(horz_break^2) + I(release_extension^2) + I(release_pos_x^2) + I(release_pos_y^2) + I(release_speed^2), data = mlb_reg_2122_LHP_FB)
+# 
+# raw_stuff_lhp_fb <- as.vector(predict(lhp_fb_mod, newdata = mlb_reg_23_LHP_FB))
+# # summary(lhp_fb_mod)
+# mlb_reg_23_LHP_FB$raw_stuff <- raw_stuff_lhp_fb
+# mlb_reg_23_LHP_FB$normalized_stuff <- -1*(mlb_reg_23_LHP_FB$raw_stuff - mean(mlb_reg_23_LHP_FB$raw_stuff))/sd(mlb_reg_23_LHP_FB$raw_stuff)
+# mlb_reg_23_LHP_FB$final_stuff <- mlb_reg_23_LHP_FB$normalized_stuff*50 + 100
+# 
+# lhp_fb_stuff <- mlb_reg_23_LHP_FB %>% group_by(player_name) %>%
+#   dplyr::summarize('T2Stuff+' = mean(final_stuff))
+
+```
+
+
+## Couldn't get decision tree to work with rpart... trying "C50" algorithm - why idk
+
+```{r}
+# RV_events ~ ind_vert_break + horz_break + release_extension + release_pos_x + release_pos_y + release_speed
+# cart_rhp_fb <- rpart(RV_events ~ ind_vert_break + horz_break + release_extension + release_pos_x + release_pos_y + release_speed, data=mlb_reg_2122_RHP_FB, method = "class")#, control = rpart.control(cp = 0.001, minsplit = 50))
+# par(xpd = NA)
+# plot(cart_rhp_fb)
+# text(cart_rhp_fb, digits = 3)
+```
